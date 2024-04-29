@@ -2,6 +2,7 @@ package dnsforward
 
 import (
 	"net"
+	"net/netip"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
@@ -23,7 +24,18 @@ func (s *Server) processQueryLogsAndStats(dctx *dnsContext) (rc resultCode) {
 	host := aghnet.NormalizeDomain(q.Name)
 	processingTime := time.Since(dctx.startTime)
 
-	ip := pctx.Addr.Addr().AsSlice()
+	var reqECSAddr netip.Addr
+	if pctx.ReqECS != nil && pctx.ReqECS.IP != nil {
+		// Use the IP from the ECS option if it's available.
+		reqECSAddr, _ = netip.ParseAddr(pctx.ReqECS.IP.String())
+	}
+
+	var ip []byte
+	if reqECSAddr.IsValid() {
+		ip = reqECSAddr.AsSlice()
+	} else {
+		ip = pctx.Addr.Addr().AsSlice()
+	}
 	s.anonymizer.Load()(ip)
 	ipStr := net.IP(ip).String()
 

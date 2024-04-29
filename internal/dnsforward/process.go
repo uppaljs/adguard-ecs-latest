@@ -81,6 +81,38 @@ const (
 // See https://www.ietf.org/archive/id/draft-ietf-add-ddr-06.html.
 const ddrHostFQDN = "_dns.resolver.arpa."
 
+// ecsFromMsg returns the subnet from EDNS Client Subnet option of m if any.
+func ecsFromMsg(m *dns.Msg) (subnet *net.IPNet, scope int) {
+	opt := m.IsEdns0()
+	if opt == nil {
+		return nil, 0
+	}
+
+	var ip net.IP
+	var mask net.IPMask
+	for _, e := range opt.Option {
+		sn, ok := e.(*dns.EDNS0_SUBNET)
+		if !ok {
+			continue
+		}
+
+		switch sn.Family {
+		case 1:
+			ip = sn.Address.To4()
+			mask = net.CIDRMask(int(sn.SourceNetmask), netutil.IPv4BitLen)
+		case 2:
+			ip = sn.Address
+			mask = net.CIDRMask(int(sn.SourceNetmask), netutil.IPv6BitLen)
+		default:
+			continue
+		}
+
+		return &net.IPNet{IP: ip, Mask: mask}, int(sn.SourceScope)
+	}
+
+	return nil, 0
+}
+
 // handleDNSRequest filters the incoming DNS requests and writes them to the query log
 func (s *Server) handleDNSRequest(_ *proxy.Proxy, pctx *proxy.DNSContext) error {
 	dctx := &dnsContext{
@@ -96,7 +128,9 @@ func (s *Server) handleDNSRequest(_ *proxy.Proxy, pctx *proxy.DNSContext) error 
 	// out of range checking in any of the following functions, because the
 	// (*proxy.Proxy).handleDNSRequest method performs it before calling the
 	// appropriate handler.
+
 	mods := []modProcessFunc{
+		s.processECS,
 		s.processInitial,
 		s.processDDRQuery,
 		s.processDHCPHosts,
@@ -145,6 +179,19 @@ const mozillaFQDN = "use-application-dns.net."
 // [Section 6.2 of RFC 6761]: https://www.rfc-editor.org/rfc/rfc6761.html#section-6.2
 const healthcheckFQDN = "healthcheck.adguardhome.test."
 
+func (s *Server) processECS(dctx *dnsContext) (rc resultCode) {
+	pctx := dctx.proxyCtx
+
+	if ecs, _ := ecsFromMsg(pctx.Req); ecs != nil {
+		if ones, _ := ecs.Mask.Size(); ones != 0 {
+			pctx.ReqECS = ecs
+			log.Debug("dnsproxy: passing through ecs: %s", pctx.ReqECS)
+		}
+	}
+
+	return resultCodeSuccess
+}
+
 // processInitial terminates the following processing for some requests if
 // needed and enriches dctx with some client-specific information.
 //
@@ -154,7 +201,18 @@ func (s *Server) processInitial(dctx *dnsContext) (rc resultCode) {
 	defer log.Debug("dnsforward: finished processing initial")
 
 	pctx := dctx.proxyCtx
-	s.processClientIP(pctx.Addr.Addr())
+
+	var reqECSAddr netip.Addr
+	if pctx.ReqECS != nil && pctx.ReqECS.IP != nil {
+		// Use the IP from the ECS option if it's available.
+		reqECSAddr, _ = netip.ParseAddr(pctx.ReqECS.IP.String())
+	}
+
+	if reqECSAddr.IsValid() {
+		s.processClientIP(reqECSAddr)
+	} else {
+		s.processClientIP(pctx.Addr.Addr())
+	}
 
 	q := pctx.Req.Question[0]
 	qt := q.Qtype
