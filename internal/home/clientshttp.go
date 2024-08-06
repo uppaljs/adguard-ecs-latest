@@ -96,10 +96,12 @@ func (clients *clientsContainer) handleGetClients(w http.ResponseWriter, r *http
 	clients.lock.Lock()
 	defer clients.lock.Unlock()
 
-	for _, c := range clients.list {
+	clients.storage.RangeByName(func(c *client.Persistent) (cont bool) {
 		cj := clientToJSON(c)
 		data.Clients = append(data.Clients, cj)
-	}
+
+		return true
+	})
 
 	clients.runtimeIndex.Range(func(rc *client.Runtime) (cont bool) {
 		src, host := rc.Info()
@@ -246,6 +248,7 @@ func copySafeSearch(
 	if conf.Enabled {
 		conf.Bing = true
 		conf.DuckDuckGo = true
+		conf.Ecosia = true
 		conf.Google = true
 		conf.Pixabay = true
 		conf.Yandex = true
@@ -265,7 +268,7 @@ func copyBlockedServices(
 	var weekly *schedule.Weekly
 	if sch != nil {
 		weekly = sch.Clone()
-	} else if prev != nil && prev.BlockedServices != nil {
+	} else if prev != nil {
 		weekly = prev.BlockedServices.Schedule.Clone()
 	} else {
 		weekly = schedule.EmptyWeekly()
@@ -334,20 +337,16 @@ func (clients *clientsContainer) handleAddClient(w http.ResponseWriter, r *http.
 		return
 	}
 
-	ok, err := clients.add(c)
+	err = clients.storage.Add(c)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	if !ok {
-		aghhttp.Error(r, w, http.StatusBadRequest, "Client already exists")
-
-		return
+	if !clients.testing {
+		onConfigModified()
 	}
-
-	onConfigModified()
 }
 
 // handleDelClient is the handler for POST /control/clients/delete HTTP API.
@@ -366,13 +365,15 @@ func (clients *clientsContainer) handleDelClient(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if !clients.remove(cj.Name) {
+	if !clients.storage.RemoveByName(cj.Name) {
 		aghhttp.Error(r, w, http.StatusBadRequest, "Client not found")
 
 		return
 	}
 
-	onConfigModified()
+	if !clients.testing {
+		onConfigModified()
+	}
 }
 
 // updateJSON contains the name and data of the updated persistent client.
@@ -399,37 +400,23 @@ func (clients *clientsContainer) handleUpdateClient(w http.ResponseWriter, r *ht
 		return
 	}
 
-	var prev *client.Persistent
-	var ok bool
-
-	func() {
-		clients.lock.Lock()
-		defer clients.lock.Unlock()
-
-		prev, ok = clients.list[dj.Name]
-	}()
-
-	if !ok {
-		aghhttp.Error(r, w, http.StatusBadRequest, "client not found")
-
-		return
-	}
-
-	c, err := clients.jsonToClient(dj.Data, prev)
+	c, err := clients.jsonToClient(dj.Data, nil)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	err = clients.update(prev, c)
+	err = clients.storage.Update(dj.Name, c)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	onConfigModified()
+	if !clients.testing {
+		onConfigModified()
+	}
 }
 
 // handleFindClient is the handler for GET /control/clients/find HTTP API.
@@ -449,7 +436,7 @@ func (clients *clientsContainer) handleFindClient(w http.ResponseWriter, r *http
 			cj = clients.findRuntime(ip, idStr)
 		} else {
 			cj = clientToJSON(c)
-			disallowed, rule := clients.dnsServer.IsBlockedClient(ip, idStr)
+			disallowed, rule := clients.clientChecker.IsBlockedClient(ip, idStr)
 			cj.Disallowed, cj.DisallowedRule = &disallowed, &rule
 		}
 
@@ -472,7 +459,7 @@ func (clients *clientsContainer) findRuntime(ip netip.Addr, idStr string) (cj *c
 		// blocked IP list.
 		//
 		// See https://github.com/AdguardTeam/AdGuardHome/issues/2428.
-		disallowed, rule := clients.dnsServer.IsBlockedClient(ip, idStr)
+		disallowed, rule := clients.clientChecker.IsBlockedClient(ip, idStr)
 		cj = &clientJSON{
 			IDs:            []string{idStr},
 			Disallowed:     &disallowed,
@@ -490,7 +477,7 @@ func (clients *clientsContainer) findRuntime(ip netip.Addr, idStr string) (cj *c
 		WHOIS: whoisOrEmpty(rc),
 	}
 
-	disallowed, rule := clients.dnsServer.IsBlockedClient(ip, idStr)
+	disallowed, rule := clients.clientChecker.IsBlockedClient(ip, idStr)
 	cj.Disallowed, cj.DisallowedRule = &disallowed, &rule
 
 	return cj
