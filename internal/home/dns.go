@@ -1,6 +1,7 @@
 package home
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/stats"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/ameshkov/dnscrypt/v2"
 	yaml "gopkg.in/yaml.v3"
@@ -45,15 +47,11 @@ func onConfigModified() {
 // initDNS updates all the fields of the [Context] needed to initialize the DNS
 // server and initializes it at last.  It also must not be called unless
 // [config] and [Context] are initialized.  l must not be nil.
-func initDNS(l *slog.Logger) (err error) {
+func initDNS(l *slog.Logger, statsDir, querylogDir string) (err error) {
 	anonymizer := config.anonymizer()
 
-	statsDir, querylogDir, err := checkStatsAndQuerylogDirs(&Context, config)
-	if err != nil {
-		return err
-	}
-
 	statsConf := stats.Config{
+		Logger:            l.With(slogutil.KeyPrefix, "stats"),
 		Filename:          filepath.Join(statsDir, "stats.db"),
 		Limit:             config.Stats.Interval.Duration,
 		ConfigModified:    onConfigModified,
@@ -412,9 +410,9 @@ func applyAdditionalFiltering(clientIP netip.Addr, clientID string, setts *filte
 
 	setts.ClientIP = clientIP
 
-	c, ok := Context.clients.find(clientID)
+	c, ok := Context.clients.storage.Find(clientID)
 	if !ok {
-		c, ok = Context.clients.find(clientIP.String())
+		c, ok = Context.clients.storage.Find(clientIP.String())
 		if !ok {
 			log.Debug("%s: no clients with ip %s and clientid %q", pref, clientIP, clientID)
 
@@ -457,11 +455,15 @@ func startDNSServer() error {
 
 	Context.filters.EnableFilters(false)
 
-	Context.clients.Start()
-
-	err := Context.dnsServer.Start()
+	// TODO(s.chzhen):  Pass context.
+	err := Context.clients.Start(context.TODO())
 	if err != nil {
-		return fmt.Errorf("couldn't start forwarding DNS server: %w", err)
+		return fmt.Errorf("starting clients container: %w", err)
+	}
+
+	err = Context.dnsServer.Start()
+	if err != nil {
+		return fmt.Errorf("starting dns server: %w", err)
 	}
 
 	Context.filters.Start()
@@ -498,7 +500,7 @@ func stopDNSServer() (err error) {
 		return fmt.Errorf("stopping forwarding dns server: %w", err)
 	}
 
-	err = Context.clients.close()
+	err = Context.clients.close(context.TODO())
 	if err != nil {
 		return fmt.Errorf("closing clients container: %w", err)
 	}

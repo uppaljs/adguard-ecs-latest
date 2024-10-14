@@ -31,6 +31,7 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering/hashprefix"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering/safesearch"
+	"github.com/AdguardTeam/AdGuardHome/internal/permcheck"
 	"github.com/AdguardTeam/AdGuardHome/internal/querylog"
 	"github.com/AdguardTeam/AdGuardHome/internal/stats"
 	"github.com/AdguardTeam/AdGuardHome/internal/updater"
@@ -39,6 +40,7 @@ import (
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/hostsfile"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/osutil"
 )
@@ -118,7 +120,7 @@ func Main(clientBuildFS fs.FS) {
 			log.Info("Received signal %q", sig)
 			switch sig {
 			case syscall.SIGHUP:
-				Context.clients.reloadARP()
+				Context.clients.storage.ReloadARP()
 				Context.tls.reload()
 			default:
 				cleanup(context.Background())
@@ -146,6 +148,14 @@ func setupContext(opts options) (err error) {
 	Context.tlsRoots = aghtls.SystemRootCAs()
 	Context.mux = http.NewServeMux()
 
+	if !opts.noEtcHosts {
+		err = setupHostsContainer()
+		if err != nil {
+			// Don't wrap the error, because it's informative enough as is.
+			return err
+		}
+	}
+
 	if Context.firstRun {
 		log.Info("This is the first time AdGuard Home is launched")
 		checkPermissions()
@@ -164,14 +174,6 @@ func setupContext(opts options) (err error) {
 		log.Info("configuration file is ok")
 
 		os.Exit(0)
-	}
-
-	if !opts.noEtcHosts {
-		err = setupHostsContainer()
-		if err != nil {
-			// Don't wrap the error, because it's informative enough as is.
-			return err
-		}
 	}
 
 	return nil
@@ -276,8 +278,8 @@ func setupOpts(opts options) (err error) {
 }
 
 // initContextClients initializes Context clients and related fields.
-func initContextClients() (err error) {
-	err = setupDNSFilteringConf(config.Filtering)
+func initContextClients(ctx context.Context, logger *slog.Logger) (err error) {
+	err = setupDNSFilteringConf(ctx, logger, config.Filtering)
 	if err != nil {
 		// Don't wrap the error, because it's informative enough as is.
 		return err
@@ -300,10 +302,12 @@ func initContextClients() (err error) {
 
 	var arpDB arpdb.Interface
 	if config.Clients.Sources.ARP {
-		arpDB = arpdb.New()
+		arpDB = arpdb.New(logger.With(slogutil.KeyError, "arpdb"))
 	}
 
 	return Context.clients.Init(
+		ctx,
+		logger,
 		config.Clients.Persistent,
 		Context.dhcpServer,
 		Context.etcHosts,
@@ -353,7 +357,11 @@ func setupBindOpts(opts options) (err error) {
 }
 
 // setupDNSFilteringConf sets up DNS filtering configuration settings.
-func setupDNSFilteringConf(conf *filtering.Config) (err error) {
+func setupDNSFilteringConf(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	conf *filtering.Config,
+) (err error) {
 	const (
 		dnsTimeout = 3 * time.Second
 
@@ -444,12 +452,13 @@ func setupDNSFilteringConf(conf *filtering.Config) (err error) {
 		conf.ParentalBlockHost = host
 	}
 
-	conf.SafeSearch, err = safesearch.NewDefault(
-		conf.SafeSearchConf,
-		"default",
-		conf.SafeSearchCacheSize,
-		cacheTime,
-	)
+	logger := baseLogger.With(slogutil.KeyPrefix, safesearch.LogPrefix)
+	conf.SafeSearch, err = safesearch.NewDefault(ctx, &safesearch.DefaultConfig{
+		Logger:         logger,
+		ServicesConfig: conf.SafeSearchConf,
+		CacheSize:      conf.SafeSearchCacheSize,
+		CacheTTL:       cacheTime,
+	})
 	if err != nil {
 		return fmt.Errorf("initializing safesearch: %w", err)
 	}
@@ -582,7 +591,10 @@ func run(opts options, clientBuildFS fs.FS, done chan struct{}) {
 	// data first, but also to avoid relying on automatic Go init() function.
 	filtering.InitModule()
 
-	err = initContextClients()
+	// TODO(s.chzhen):  Use it for the entire initialization process.
+	ctx := context.Background()
+
+	err = initContextClients(ctx, slogLogger)
 	fatalOnError(err)
 
 	err = setupOpts(opts)
@@ -629,9 +641,9 @@ func run(opts options, clientBuildFS fs.FS, done chan struct{}) {
 		}
 	}
 
-	dir := Context.getDataDir()
-	err = os.MkdirAll(dir, 0o755)
-	fatalOnError(errors.Annotate(err, "creating DNS data dir at %s: %w", dir))
+	dataDir := Context.getDataDir()
+	err = os.MkdirAll(dataDir, aghos.DefaultPermDir)
+	fatalOnError(errors.Annotate(err, "creating DNS data dir at %s: %w", dataDir))
 
 	GLMode = opts.glinetMode
 
@@ -648,8 +660,11 @@ func run(opts options, clientBuildFS fs.FS, done chan struct{}) {
 	Context.web, err = initWeb(opts, clientBuildFS, upd, slogLogger)
 	fatalOnError(err)
 
+	statsDir, querylogDir, err := checkStatsAndQuerylogDirs(&Context, config)
+	fatalOnError(err)
+
 	if !Context.firstRun {
-		err = initDNS(slogLogger)
+		err = initDNS(slogLogger, statsDir, querylogDir)
 		fatalOnError(err)
 
 		Context.tls.start()
@@ -669,6 +684,12 @@ func run(opts options, clientBuildFS fs.FS, done chan struct{}) {
 			}
 		}
 	}
+
+	if permcheck.NeedsMigration(confPath) {
+		permcheck.Migrate(Context.workDir, dataDir, statsDir, querylogDir, confPath)
+	}
+
+	permcheck.Check(Context.workDir, dataDir, statsDir, querylogDir, confPath)
 
 	Context.web.start()
 
@@ -713,7 +734,12 @@ func (c *configuration) anonymizer() (ipmut *aghnet.IPMut) {
 // startMods initializes and starts the DNS server after installation.  l must
 // not be nil.
 func startMods(l *slog.Logger) (err error) {
-	err = initDNS(l)
+	statsDir, querylogDir, err := checkStatsAndQuerylogDirs(&Context, config)
+	if err != nil {
+		return err
+	}
+
+	err = initDNS(l, statsDir, querylogDir)
 	if err != nil {
 		return err
 	}

@@ -1,6 +1,7 @@
 package home
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,8 +11,10 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/client"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering/safesearch"
 	"github.com/AdguardTeam/AdGuardHome/internal/schedule"
 	"github.com/AdguardTeam/AdGuardHome/internal/whois"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 )
 
 // clientJSON is a common structure used by several handlers to deal with
@@ -103,7 +106,9 @@ func (clients *clientsContainer) handleGetClients(w http.ResponseWriter, r *http
 		return true
 	})
 
-	clients.runtimeIndex.Range(func(rc *client.Runtime) (cont bool) {
+	clients.storage.UpdateDHCP()
+
+	clients.storage.RangeRuntime(func(rc *client.Runtime) (cont bool) {
 		src, host := rc.Info()
 		cj := runtimeClientJSON{
 			WHOIS:  whoisOrEmpty(rc),
@@ -117,18 +122,7 @@ func (clients *clientsContainer) handleGetClients(w http.ResponseWriter, r *http
 		return true
 	})
 
-	for _, l := range clients.dhcp.Leases() {
-		cj := runtimeClientJSON{
-			Name:   l.Hostname,
-			Source: client.SourceDHCP,
-			IP:     l.IP,
-			WHOIS:  &whois.Info{},
-		}
-
-		data.RuntimeClients = append(data.RuntimeClients, cj)
-	}
-
-	data.Tags = clientTags
+	data.Tags = clients.storage.AllowedTags()
 
 	aghhttp.WriteJSONResponseOK(w, r, data)
 }
@@ -190,6 +184,7 @@ func initPrev(cj clientJSON, prev *client.Persistent) (c *client.Persistent, err
 // jsonToClient converts JSON object to persistent client object if there are no
 // errors.
 func (clients *clientsContainer) jsonToClient(
+	ctx context.Context,
 	cj clientJSON,
 	prev *client.Persistent,
 ) (c *client.Persistent, err error) {
@@ -216,14 +211,23 @@ func (clients *clientsContainer) jsonToClient(
 	c.UseOwnBlockedServices = !cj.UseGlobalBlockedServices
 
 	if c.SafeSearchConf.Enabled {
-		err = c.SetSafeSearch(
-			c.SafeSearchConf,
-			clients.safeSearchCacheSize,
-			clients.safeSearchCacheTTL,
+		logger := clients.baseLogger.With(
+			slogutil.KeyPrefix, safesearch.LogPrefix,
+			safesearch.LogKeyClient, c.Name,
 		)
+		var ss *safesearch.Default
+		ss, err = safesearch.NewDefault(ctx, &safesearch.DefaultConfig{
+			Logger:         logger,
+			ServicesConfig: c.SafeSearchConf,
+			ClientName:     c.Name,
+			CacheSize:      clients.safeSearchCacheSize,
+			CacheTTL:       clients.safeSearchCacheTTL,
+		})
 		if err != nil {
 			return nil, fmt.Errorf("creating safesearch for client %q: %w", c.Name, err)
 		}
+
+		c.SafeSearch = ss
 	}
 
 	return c, nil
@@ -330,7 +334,7 @@ func (clients *clientsContainer) handleAddClient(w http.ResponseWriter, r *http.
 		return
 	}
 
-	c, err := clients.jsonToClient(cj, nil)
+	c, err := clients.jsonToClient(r.Context(), cj, nil)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
 
@@ -400,7 +404,7 @@ func (clients *clientsContainer) handleUpdateClient(w http.ResponseWriter, r *ht
 		return
 	}
 
-	c, err := clients.jsonToClient(dj.Data, nil)
+	c, err := clients.jsonToClient(r.Context(), dj.Data, nil)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
 
@@ -430,7 +434,7 @@ func (clients *clientsContainer) handleFindClient(w http.ResponseWriter, r *http
 		}
 
 		ip, _ := netip.ParseAddr(idStr)
-		c, ok := clients.find(idStr)
+		c, ok := clients.storage.Find(idStr)
 		var cj *clientJSON
 		if !ok {
 			cj = clients.findRuntime(ip, idStr)
@@ -452,7 +456,7 @@ func (clients *clientsContainer) handleFindClient(w http.ResponseWriter, r *http
 // /etc/hosts tables, DHCP leases, or blocklists.  cj is guaranteed to be
 // non-nil.
 func (clients *clientsContainer) findRuntime(ip netip.Addr, idStr string) (cj *clientJSON) {
-	rc := clients.findRuntimeClient(ip)
+	rc := clients.storage.ClientRuntime(ip)
 	if rc == nil {
 		// It is still possible that the IP used to be in the runtime clients
 		// list, but then the server was reloaded.  So, check the DNS server's

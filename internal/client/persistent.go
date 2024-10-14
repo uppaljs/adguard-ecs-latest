@@ -7,13 +7,10 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
-	"github.com/AdguardTeam/AdGuardHome/internal/filtering/safesearch"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
-	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/netutil"
@@ -136,7 +133,8 @@ type Persistent struct {
 }
 
 // validate returns an error if persistent client information contains errors.
-func (c *Persistent) validate(allTags *container.MapSet[string]) (err error) {
+// allTags must be sorted.
+func (c *Persistent) validate(allTags []string) (err error) {
 	switch {
 	case c.Name == "":
 		return errors.Error("empty name")
@@ -157,7 +155,8 @@ func (c *Persistent) validate(allTags *container.MapSet[string]) (err error) {
 	}
 
 	for _, t := range c.Tags {
-		if !allTags.Has(t) {
+		_, ok := slices.BinarySearch(allTags, t)
+		if !ok {
 			return fmt.Errorf("invalid tag: %q", t)
 		}
 	}
@@ -319,23 +318,6 @@ func (c *Persistent) CloseUpstreams() (err error) {
 			return fmt.Errorf("closing upstreams of client %q: %w", c.Name, err)
 		}
 	}
-
-	return nil
-}
-
-// SetSafeSearch initializes and sets the safe search filter for this client.
-func (c *Persistent) SetSafeSearch(
-	conf filtering.SafeSearchConfig,
-	cacheSize uint,
-	cacheTTL time.Duration,
-) (err error) {
-	ss, err := safesearch.NewDefault(conf, fmt.Sprintf("client %q", c.Name), cacheSize, cacheTTL)
-	if err != nil {
-		// Don't wrap the error, because it's informative enough as is.
-		return err
-	}
-
-	c.SafeSearch = ss
 
 	return nil
 }
